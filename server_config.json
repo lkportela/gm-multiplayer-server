@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "online": true,
+  "host": "trolley.proxy.rlwy.net",
+  "port": 52130,
+  "max_players": 8,
+  "motd": ""
+}
