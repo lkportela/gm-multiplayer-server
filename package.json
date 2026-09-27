@@ -1,8 +1,8 @@
 {
-  "name": "gamemaker-multiplayer-test-server",
+  "name": "guns-guys-railway-relay",
   "version": "1.0.0",
   "private": true,
-  "description": "Servidor TCP simples para teste GameMaker",
+  "description": "TCP RAW relay and server browser for the GameMaker project",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
