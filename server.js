@@ -1,101 +1,997 @@
-const net = require("net");
+'use strict';
 
-// Porta interna. No Railway crie um TCP Proxy apontando para 6510.
-const PORT = 6510;
-const HOST = "0.0.0.0";
+const net = require('net');
+const crypto = require('crypto');
 
-let nextId = 1;
-const clients = new Map();
+const PORT = Number(process.env.PORT || 6510);
+const HOST = process.env.HOST || '0.0.0.0';
+const MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
+const QUERY_TIMEOUT_MS = 12_000;
+const PARTICIPANT_TIMEOUT_MS = 30_000;
+const RESUME_GRACE_MS = 15_000;
+const SERVER_MAX_PLAYERS = Math.max(
+  2,
+  Math.min(64, Number(process.env.MAX_PLAYERS || 8))
+);
 
-function safeSend(socket, packet) {
-  if (!socket.destroyed) socket.write(JSON.stringify(packet) + "\n");
+const rooms = new Map();
+const contexts = new Map();
+const resumableRooms = new Map();
+
+function now() {
+  return Date.now();
 }
 
-function snapshot() {
-  const players = [];
-  for (const client of clients.values()) {
-    players.push({ id: client.id, x: client.x, y: client.y });
+function clampInt(value, min, max, fallback) {
+  if (!Number.isFinite(value)) return fallback;
+
+  return Math.max(
+    min,
+    Math.min(max, Math.floor(value))
+  );
+}
+
+function safeString(value, max, fallback = '') {
+  if (typeof value !== 'string') return fallback;
+
+  const clean = value
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .trim();
+
+  return clean.slice(0, max) || fallback;
+}
+
+function validId(value) {
+  return (
+    typeof value === 'string' &&
+    /^[A-Za-z0-9_-]{3,64}$/.test(value)
+  );
+}
+
+function randomId(bytes = 6) {
+  return crypto.randomBytes(bytes).toString('hex');
+}
+
+function send(socket, packet) {
+  if (
+    !socket ||
+    socket.destroyed ||
+    typeof packet !== 'object' ||
+    packet === null
+  ) {
+    return false;
   }
-  const packet = { t: "snapshot", players };
-  for (const client of clients.values()) safeSend(client.socket, packet);
+
+  let line;
+
+  try {
+    line = JSON.stringify(packet) + '\n';
+  } catch {
+    return false;
+  }
+
+  if (Buffer.byteLength(line, 'utf8') > MAX_MESSAGE_BYTES) {
+    return false;
+  }
+
+  try {
+    return socket.write(line, 'utf8');
+  } catch {
+    return false;
+  }
 }
 
-function spawnFor(id) {
+function contextFor(socket) {
+  let ctx = contexts.get(socket);
+
+  if (!ctx) {
+    ctx = {
+      socket,
+      buffer: '',
+      role: 'query',
+      roomId: '',
+      slot: -1,
+      lastSeen: now()
+    };
+
+    contexts.set(socket, ctx);
+  }
+
+  return ctx;
+}
+
+function roomPlayerCount(room) {
+  return (
+    room &&
+    room.hostSocket &&
+    !room.hostSocket.destroyed
+  )
+    ? 1 + room.clients.size
+    : 0;
+}
+
+function totalPlayers() {
+  let total = 0;
+
+  for (const room of rooms.values()) {
+    total += roomPlayerCount(room);
+  }
+
+  return total;
+}
+
+function makeRoomSummary(room) {
   return {
-    x: 100 + ((id * 137) % 760),
-    y: 100 + ((id * 83) % 340),
+    server_id: room.id,
+    name: room.name,
+    players: roomPlayerCount(room),
+    max_players: room.maxPlayers,
+    protocol: room.protocol,
+    version: room.version,
+    status: room.status
   };
 }
 
-const server = net.createServer((socket) => {
-  socket.setNoDelay(true);
+function cleanupResumable() {
+  const t = now();
 
-  const id = nextId++;
-  const spawn = spawnFor(id);
-  const client = {
-    socket,
-    id,
-    x: spawn.x,
-    y: spawn.y,
-    incoming: "",
+  for (const [id, info] of resumableRooms) {
+    if (info.expiresAt <= t) {
+      resumableRooms.delete(id);
+    }
+  }
+}
+
+function rememberForResume(room) {
+  if (!room || !room.id || !room.hostToken) {
+    return;
+  }
+
+  resumableRooms.set(room.id, {
+    id: room.id,
+    hostToken: room.hostToken,
+    name: room.name,
+    maxPlayers: room.maxPlayers,
+    protocol: room.protocol,
+    version: room.version,
+    expiresAt: now() + RESUME_GRACE_MS
+  });
+}
+
+function closeRoom(
+  room,
+  reason = 'host_left',
+  allowResume = true
+) {
+  if (!room || rooms.get(room.id) !== room) {
+    return;
+  }
+
+  rooms.delete(room.id);
+
+  if (allowResume) {
+    rememberForResume(room);
+  }
+
+  for (const [slot, socket] of room.clients) {
+    const cctx = contexts.get(socket);
+
+    if (cctx) {
+      cctx.role = 'query';
+      cctx.roomId = '';
+      cctx.slot = -1;
+    }
+
+    send(socket, {
+      v: room.protocol,
+      kind: 'host_left',
+      server_id: room.id,
+      reason
+    });
+  }
+
+  room.clients.clear();
+
+  console.log(
+    `[room] closed ${room.id} (${reason})`
+  );
+}
+
+function leaveClient(ctx, notifyHost = true) {
+  if (!ctx || ctx.role !== 'client') {
+    return;
+  }
+
+  const room = rooms.get(ctx.roomId);
+  const slot = ctx.slot;
+
+  if (
+    room &&
+    room.clients.get(slot) === ctx.socket
+  ) {
+    room.clients.delete(slot);
+
+    if (notifyHost) {
+      send(room.hostSocket, {
+        v: room.protocol,
+        kind: 'peer_leave',
+        slot
+      });
+    }
+
+    console.log(
+      `[room] ${room.id} client left slot=${slot}`
+    );
+  }
+
+  ctx.role = 'query';
+  ctx.roomId = '';
+  ctx.slot = -1;
+}
+
+function leaveHost(ctx, allowResume = true) {
+  if (!ctx || ctx.role !== 'host') {
+    return;
+  }
+
+  const room = rooms.get(ctx.roomId);
+
+  if (
+    room &&
+    room.hostSocket === ctx.socket
+  ) {
+    closeRoom(
+      room,
+      'host_left',
+      allowResume
+    );
+  }
+
+  ctx.role = 'query';
+  ctx.roomId = '';
+  ctx.slot = -1;
+}
+
+function unregisterContext(ctx) {
+  if (!ctx) return;
+
+  if (ctx.role === 'client') {
+    leaveClient(ctx, true);
+  } else if (ctx.role === 'host') {
+    leaveHost(ctx, true);
+  }
+
+  contexts.delete(ctx.socket);
+}
+
+function allocateSlot(room) {
+  for (
+    let slot = 1;
+    slot < room.maxPlayers;
+    slot++
+  ) {
+    if (!room.clients.has(slot)) {
+      return slot;
+    }
+  }
+
+  return -1;
+}
+
+function handleStatus(ctx, packet) {
+  send(ctx.socket, {
+    v: Number.isFinite(packet.v)
+      ? packet.v
+      : 4,
+
+    kind: 'status',
+    online: true,
+    players: totalPlayers(),
+    max_players: SERVER_MAX_PLAYERS,
+    protocol: 4
+  });
+}
+
+function handlePing(ctx, packet) {
+  const nonce = Number.isFinite(packet.nonce)
+    ? packet.nonce
+    : 0;
+
+  send(ctx.socket, {
+    v: Number.isFinite(packet.v)
+      ? packet.v
+      : 4,
+
+    kind: 'pong',
+    nonce
+  });
+}
+
+function handleServerList(ctx, packet) {
+  const requestedProtocol =
+    Number.isFinite(packet.v)
+      ? Math.floor(packet.v)
+      : -1;
+
+  const list = [];
+
+  for (const room of rooms.values()) {
+    if (room.status !== 'online') {
+      continue;
+    }
+
+    if (
+      !room.hostSocket ||
+      room.hostSocket.destroyed
+    ) {
+      continue;
+    }
+
+    if (
+      requestedProtocol > 0 &&
+      room.protocol !== requestedProtocol
+    ) {
+      continue;
+    }
+
+    list.push(
+      makeRoomSummary(room)
+    );
+  }
+
+  send(ctx.socket, {
+    v:
+      requestedProtocol > 0
+        ? requestedProtocol
+        : 4,
+
+    kind: 'server_list',
+    servers: list
+  });
+}
+
+function handleHostRegister(ctx, packet) {
+  if (
+    ctx.role !== 'query' &&
+    ctx.role !== 'host'
+  ) {
+    return;
+  }
+
+  cleanupResumable();
+
+  const protocol = clampInt(
+    packet.protocol ?? packet.v,
+    1,
+    32,
+    4
+  );
+
+  const maxPlayers = clampInt(
+    packet.max_players,
+    2,
+    SERVER_MAX_PLAYERS,
+    SERVER_MAX_PLAYERS
+  );
+
+  const name = safeString(
+    packet.name,
+    32,
+    'Servidor'
+  );
+
+  const version = safeString(
+    packet.version,
+    24,
+    '1.0'
+  );
+
+  let roomId = '';
+  let hostToken = '';
+
+  const resumeId = safeString(
+    packet.resume_id,
+    64,
+    ''
+  );
+
+  const suppliedToken = safeString(
+    packet.host_token,
+    128,
+    ''
+  );
+
+  if (
+    resumeId &&
+    suppliedToken
+  ) {
+    const saved =
+      resumableRooms.get(resumeId);
+
+    if (
+      saved &&
+      saved.hostToken === suppliedToken &&
+      saved.expiresAt > now() &&
+      !rooms.has(resumeId)
+    ) {
+      roomId = resumeId;
+      hostToken = suppliedToken;
+
+      resumableRooms.delete(
+        resumeId
+      );
+    }
+  }
+
+  if (!roomId) {
+    do {
+      roomId = randomId(6);
+    } while (rooms.has(roomId));
+
+    hostToken = randomId(24);
+  }
+
+  if (ctx.role === 'host') {
+    leaveHost(ctx, false);
+  }
+
+  const room = {
+    id: roomId,
+    name,
+    maxPlayers,
+    protocol,
+    version,
+    status: 'starting',
+    hostSocket: ctx.socket,
+    hostToken,
+    clients: new Map(),
+    createdAt: now(),
+    updatedAt: now()
   };
-  clients.set(socket, client);
 
-  console.log(`[+] Player ${id} conectado - ${socket.remoteAddress}`);
-  safeSend(socket, { t: "welcome", id, x: client.x, y: client.y });
-  snapshot();
+  rooms.set(roomId, room);
 
-  socket.on("data", (data) => {
-    client.incoming += data.toString("utf8");
+  ctx.role = 'host';
+  ctx.roomId = roomId;
+  ctx.slot = 0;
 
-    let newline;
-    while ((newline = client.incoming.indexOf("\n")) >= 0) {
-      const line = client.incoming.slice(0, newline).trim();
-      client.incoming = client.incoming.slice(newline + 1);
-      if (!line) continue;
+  send(ctx.socket, {
+    v: protocol,
+    kind: 'host_registered',
+    server_id: roomId,
+    host_token: hostToken,
+    resumed:
+      resumeId === roomId
+  });
 
-      try {
-        const packet = JSON.parse(line);
+  console.log(
+    `[room] registered ${roomId} name="${name}" protocol=${protocol}`
+  );
+}
 
-        if (packet.t === "hello") {
-          safeSend(socket, { t: "welcome", id, x: client.x, y: client.y });
-          continue;
-        }
+function handleHostUpdate(ctx, packet) {
+  if (ctx.role !== 'host') {
+    return;
+  }
 
-        if (packet.t === "pos") {
-          const x = Number(packet.x);
-          const y = Number(packet.y);
-          if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+  const room =
+    rooms.get(ctx.roomId);
 
-          // Limites da room de teste.
-          client.x = Math.max(16, Math.min(944, x));
-          client.y = Math.max(16, Math.min(524, y));
-          snapshot();
-        }
-      } catch (err) {
-        console.log(`[!] Pacote invalido do Player ${id}`);
+  if (
+    !room ||
+    room.hostSocket !== ctx.socket
+  ) {
+    return;
+  }
+
+  if (
+    packet.server_id &&
+    packet.server_id !== room.id
+  ) {
+    return;
+  }
+
+  room.name = safeString(
+    packet.name,
+    32,
+    room.name
+  );
+
+  room.maxPlayers = clampInt(
+    packet.max_players,
+    2,
+    SERVER_MAX_PLAYERS,
+    room.maxPlayers
+  );
+
+  const status =
+    packet.status === 'online'
+      ? 'online'
+      : 'starting';
+
+  room.status = status;
+  room.updatedAt = now();
+
+  send(ctx.socket, {
+    v: room.protocol,
+    kind: 'host_updated',
+    server_id: room.id,
+    players: roomPlayerCount(room)
+  });
+}
+
+function handleHostUnregister(ctx, packet) {
+  if (ctx.role !== 'host') {
+    return;
+  }
+
+  const room =
+    rooms.get(ctx.roomId);
+
+  if (
+    !room ||
+    room.hostSocket !== ctx.socket
+  ) {
+    return;
+  }
+
+  if (
+    packet.server_id &&
+    packet.server_id !== room.id
+  ) {
+    return;
+  }
+
+  closeRoom(
+    room,
+    'host_closed',
+    false
+  );
+
+  ctx.role = 'query';
+  ctx.roomId = '';
+  ctx.slot = -1;
+}
+
+function handleJoin(ctx, packet) {
+  if (ctx.role === 'client') {
+    leaveClient(ctx, true);
+  }
+
+  if (ctx.role === 'host') {
+    return;
+  }
+
+  const serverId = safeString(
+    packet.server_id,
+    64,
+    ''
+  );
+
+  if (!validId(serverId)) {
+    send(ctx.socket, {
+      v: packet.v || 4,
+      kind: 'join_error',
+      message: 'Servidor invalido.'
+    });
+
+    return;
+  }
+
+  const room =
+    rooms.get(serverId);
+
+  if (!room) {
+    cleanupResumable();
+
+    const pending =
+      resumableRooms.get(serverId);
+
+    send(ctx.socket, {
+      v: packet.v || 4,
+      kind: 'join_error',
+      retry: !!pending,
+      message: pending
+        ? 'Servidor reconectando.'
+        : 'Servidor nao encontrado.'
+    });
+
+    return;
+  }
+
+  if (room.status !== 'online') {
+    send(ctx.socket, {
+      v: room.protocol,
+      kind: 'join_error',
+      retry: true,
+      message: 'Servidor iniciando.'
+    });
+
+    return;
+  }
+
+  if (
+    Number.isFinite(packet.v) &&
+    Math.floor(packet.v) !==
+      room.protocol
+  ) {
+    send(ctx.socket, {
+      v: packet.v,
+      kind: 'join_error',
+      message:
+        'Versao de protocolo diferente.'
+    });
+
+    return;
+  }
+
+  const slot =
+    allocateSlot(room);
+
+  if (slot < 0) {
+    send(ctx.socket, {
+      v: room.protocol,
+      kind: 'join_error',
+      message: 'Servidor cheio.'
+    });
+
+    return;
+  }
+
+  ctx.role = 'client';
+  ctx.roomId = room.id;
+  ctx.slot = slot;
+
+  room.clients.set(
+    slot,
+    ctx.socket
+  );
+
+  room.updatedAt = now();
+
+  send(ctx.socket, {
+    v: room.protocol,
+    kind: 'join_ok',
+    server_id: room.id,
+    slot
+  });
+
+  send(room.hostSocket, {
+    v: room.protocol,
+    kind: 'peer_join',
+    slot
+  });
+
+  console.log(
+    `[room] ${room.id} client joined slot=${slot}`
+  );
+}
+
+function handleRelay(ctx, packet) {
+  if (
+    !packet.data ||
+    typeof packet.data !== 'object' ||
+    Array.isArray(packet.data)
+  ) {
+    return;
+  }
+
+  let dataSize = 0;
+
+  try {
+    dataSize = Buffer.byteLength(
+      JSON.stringify(packet.data),
+      'utf8'
+    );
+  } catch {
+    return;
+  }
+
+  if (
+    dataSize <= 0 ||
+    dataSize > MAX_MESSAGE_BYTES
+  ) {
+    return;
+  }
+
+  // Cliente -> Host
+  if (ctx.role === 'client') {
+    const room =
+      rooms.get(ctx.roomId);
+
+    if (
+      !room ||
+      room.clients.get(ctx.slot) !==
+        ctx.socket ||
+      !room.hostSocket ||
+      room.hostSocket.destroyed
+    ) {
+      return;
+    }
+
+    send(room.hostSocket, {
+      v: room.protocol,
+      kind: 'relay',
+      from: ctx.slot,
+      data: packet.data
+    });
+
+    return;
+  }
+
+  // Host -> Cliente
+  if (ctx.role === 'host') {
+    const room =
+      rooms.get(ctx.roomId);
+
+    if (
+      !room ||
+      room.hostSocket !== ctx.socket
+    ) {
+      return;
+    }
+
+    const slot = clampInt(
+      packet.to,
+      1,
+      room.maxPlayers - 1,
+      -1
+    );
+
+    if (slot < 1) {
+      return;
+    }
+
+    const target =
+      room.clients.get(slot);
+
+    if (
+      !target ||
+      target.destroyed
+    ) {
+      return;
+    }
+
+    send(target, {
+      v: room.protocol,
+      kind: 'relay',
+      data: packet.data
+    });
+  }
+}
+
+function handlePacket(ctx, packet) {
+  if (
+    !packet ||
+    typeof packet !== 'object' ||
+    Array.isArray(packet)
+  ) {
+    return;
+  }
+
+  const kind = safeString(
+    packet.kind,
+    40,
+    ''
+  );
+
+  if (!kind) {
+    return;
+  }
+
+  ctx.lastSeen = now();
+
+  switch (kind) {
+    case 'ping':
+      return handlePing(
+        ctx,
+        packet
+      );
+
+    case 'status':
+      return handleStatus(
+        ctx,
+        packet
+      );
+
+    case 'server_list':
+      return handleServerList(
+        ctx,
+        packet
+      );
+
+    case 'host_register':
+      return handleHostRegister(
+        ctx,
+        packet
+      );
+
+    case 'host_update':
+      return handleHostUpdate(
+        ctx,
+        packet
+      );
+
+    case 'host_unregister':
+      return handleHostUnregister(
+        ctx,
+        packet
+      );
+
+    case 'join_server':
+      return handleJoin(
+        ctx,
+        packet
+      );
+
+    case 'relay':
+      return handleRelay(
+        ctx,
+        packet
+      );
+
+    default:
+      return;
+  }
+}
+
+function consume(ctx, chunk) {
+  if (
+    !Buffer.isBuffer(chunk) ||
+    chunk.length === 0
+  ) {
+    return;
+  }
+
+  if (
+    Buffer.byteLength(
+      ctx.buffer,
+      'utf8'
+    ) +
+      chunk.length >
+    MAX_MESSAGE_BYTES * 2
+  ) {
+    ctx.socket.destroy();
+    return;
+  }
+
+  ctx.buffer +=
+    chunk.toString('utf8');
+
+  for (;;) {
+    const idx =
+      ctx.buffer.indexOf('\n');
+
+    if (idx < 0) {
+      break;
+    }
+
+    const line = ctx.buffer
+      .slice(0, idx)
+      .replace(/\r$/, '');
+
+    ctx.buffer =
+      ctx.buffer.slice(idx + 1);
+
+    if (!line) {
+      continue;
+    }
+
+    if (
+      Buffer.byteLength(
+        line,
+        'utf8'
+      ) > MAX_MESSAGE_BYTES
+    ) {
+      ctx.socket.destroy();
+      return;
+    }
+
+    let packet;
+
+    try {
+      packet = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    handlePacket(
+      ctx,
+      packet
+    );
+  }
+}
+
+const server = net.createServer(
+  (socket) => {
+    socket.setNoDelay(true);
+
+    socket.setKeepAlive(
+      true,
+      10_000
+    );
+
+    const ctx =
+      contextFor(socket);
+
+    console.log(
+      `[tcp] connect ${
+        socket.remoteAddress || '?'
+      }:${
+        socket.remotePort || '?'
+      }`
+    );
+
+    socket.on(
+      'data',
+      (chunk) =>
+        consume(ctx, chunk)
+    );
+
+    socket.on(
+      'error',
+      (err) =>
+        console.log(
+          `[tcp] error ${
+            err.code ||
+            err.message
+          }`
+        )
+    );
+
+    socket.on(
+      'close',
+      () => {
+        unregisterContext(ctx);
+
+        console.log(
+          '[tcp] disconnect'
+        );
       }
+    );
+  }
+);
+
+setInterval(() => {
+  const t = now();
+
+  cleanupResumable();
+
+  for (
+    const ctx of contexts.values()
+  ) {
+    const limit =
+      ctx.role === 'query'
+        ? QUERY_TIMEOUT_MS
+        : PARTICIPANT_TIMEOUT_MS;
+
+    if (
+      t - ctx.lastSeen > limit &&
+      !ctx.socket.destroyed
+    ) {
+      ctx.socket.destroy();
     }
-  });
+  }
+}, 5_000).unref();
 
-  socket.on("close", () => {
-    if (clients.delete(socket)) {
-      console.log(`[-] Player ${id} desconectou`);
-      snapshot();
-    }
-  });
+server.on(
+  'error',
+  (err) => {
+    console.error(
+      '[server] fatal',
+      err
+    );
 
-  socket.on("error", (err) => {
-    console.log(`[!] Player ${id}: ${err.message}`);
-  });
-});
+    process.exitCode = 1;
+  }
+);
 
-server.on("error", (err) => {
-  console.error("Erro do servidor:", err);
-  process.exit(1);
-});
-
-server.listen(PORT, HOST, () => {
-  console.log(`Servidor multiplayer rodando em ${HOST}:${PORT}`);
-  console.log("Aguardando jogadores...");
-});
+server.listen(
+  PORT,
+  HOST,
+  () => {
+    console.log(
+      `[server] TCP RAW listening on ${HOST}:${PORT}`
+    );
+  }
+);
